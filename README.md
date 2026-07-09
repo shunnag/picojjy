@@ -41,6 +41,7 @@ Wi-Fi 経由で NTP サーバー(デフォルト: `ntp.nict.jp`)から正確な�
 | `TIME_OFFSET_HOURS` | `9` | UTC からのオフセット。JJY は JST なので通常 `9` のまま |
 | `STATUS_LED` | `True` | オンボード LED を送信シンボルに同期して点滅させる |
 | `RESET_ON_ERROR` | `True` | 回復不能なエラー時に 10 秒後に自動リセットする |
+| `WATCHDOG` | `False` | ハードウェアウォッチドッグ(8 秒)を有効化。例外にならないハングからも自動復帰する。開発中は `False` 推奨(詳細は [INSTALL.md](docs/INSTALL.md)) |
 
 ## 周波数の選び方
 

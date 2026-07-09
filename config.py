@@ -35,3 +35,10 @@ STATUS_LED = True
 # Automatically reset the board 10 s after an unrecoverable error, so
 # the transmitter recovers from e.g. a long network outage on its own.
 RESET_ON_ERROR = True
+# Enable the hardware watchdog (8 s timeout).  Recovers even from hard
+# hangs that never raise an exception (e.g. a frozen Wi-Fi driver).
+# CAUTION: once enabled it cannot be turned off until the next reset,
+# so the board reboots ~8 s after you stop the program at the REPL --
+# keep this False while developing, set True for unattended operation.
+# Requires NTP_TIMEOUT_S <= 7.
+WATCHDOG = False
