@@ -37,6 +37,45 @@ Pico W / Pico 2 W
 - 抵抗は GPIO の負荷を抑えるためのものです。省略しないでください。
 - 出力は 3.3V の矩形波(40kHz または 60kHz)を JJY タイムコードで ON/OFF したものです。
 
+## 抵抗の種類と電波の強さ・消費電力
+
+### 抵抗の種類
+
+ごく一般的な**カーボン皮膜抵抗(1/4W、誤差 ±5%)**で十分です。この回路で抵抗が
+消費する電力は数十 mW 程度なので 1/8W 品でも問題なく、精度・温度特性も要求しません。
+金属皮膜抵抗や酸化金属皮膜抵抗を使っても構いません(オーバースペックなだけです)。
+
+### 抵抗値と電波の強さの関係
+
+ループアンテナの磁界強度は、コイルに流れる電流にほぼ比例します。
+この回路の電流はおおよそ I ≈ 3.3V ÷ R で決まるため、抵抗値がそのまま
+「電波の強さ」の調整つまみになります。
+
+| 抵抗値 | ピーク電流(目安) | 用途の目安 |
+|---|---|---|
+| 1kΩ | 約 3mA | 最も安全。時計のすぐ横(数 cm)に置ける場合 |
+| 470Ω | 約 7mA | 標準的なバランス |
+| 330Ω | 約 10mA | 本構成での推奨下限 |
+
+- **330Ω 未満にはしないでください。** RP2040/RP2350 の GPIO 駆動能力を超えるおそれがあります。
+- もっと強くしたい場合は、抵抗を減らすのではなく**ループの巻数や面積を増やす**か、
+  **同調させる(案 3)**方が安全で効果も大きいです。
+- 逆に強すぎる場合(離れた部屋の時計まで同期してしまう等)は、抵抗値を大きくするか
+  `config.py` の `CARRIER_DUTY` を 0.5 から下げてください。デューティを下げると
+  基本波(40/60kHz 成分)の振幅が下がります。
+
+### 消費電力の目安
+
+| 項目 | 目安 |
+|---|---|
+| アンテナ駆動分 | 約 10mW(330Ω 時。キャリア ON 率約 6 割 × デューティ 0.5 の平均) |
+| 本体(Pico W、Wi-Fi 接続状態) | 平均 60〜80mA ≒ 0.3〜0.4W |
+| Wi-Fi 送受信時のピーク | 瞬間的に 200mA 程度 |
+
+アンテナ駆動分は本体の消費に比べて誤差程度です。電源はスマホ用の
+5V/500mA 以上の USB アダプタで十分で、1 ヶ月連続稼働させても電力量は
+約 0.3kWh(電気代で十数円程度)です。
+
 ## アンテナの選択肢
 
 ### 案 1: 単線アンテナ(最も簡単)
@@ -98,3 +137,76 @@ GP15 ──[ 330Ω〜1kΩ ]──◯◯◯◯◯(10〜20 回巻き)── GND
 - GPIO に直接大きなコイルや長い電線を接続すると過負荷になる場合があります。
   必ず直列抵抗を入れてください。
 - 常時稼働させる場合は、発熱の少ない USB 電源を使用し、通気を確保してください。
+- 日本国外で日本の電波時計を使うユーザー向けの増幅方法を、次の英語セクションに
+  記載しています。**日本国内では絶対に使用しないでください。**
+
+---
+
+## Boosting the signal for users outside Japan (English)
+
+> ## ⚠️ WARNING — NEVER USE THIS IN JAPAN / 日本では絶対に使用禁止
+>
+> The circuit below exceeds the "extremely-low-power station" (微弱無線局)
+> limits of the Japanese Radio Act. Operating it **anywhere in Japan is
+> illegal**, can interfere with the official JJY broadcast and with your
+> neighbors' clocks, and is subject to criminal penalties.
+> **日本国内でこの増幅回路を使用することは電波法違反です。絶対に使用しないでください。**
+>
+> Outside Japan you are still responsible for complying with **your local
+> radio regulations**. 40 kHz and 60 kHz are used by licensed time services
+> in many countries (WWVB 60 kHz in the US, MSF 60 kHz in the UK, etc.).
+> Most jurisdictions allow unlicensed intentional radiators at these
+> frequencies only below a strict field-strength limit (e.g. FCC Part 15
+> in the US). Keep the power at the minimum that reaches your clock —
+> a couple of meters at most — and use it indoors only.
+
+### Why you might need this
+
+Japanese radio-controlled clocks ("電波時計") cannot receive JJY outside
+Japan, so they never synchronize. The passive antenna described above works
+at a few centimeters; if you want one transmitter to cover a shelf or a
+room (1–3 m), the GPIO pin alone is not strong enough, and a small
+one-transistor driver becomes useful.
+
+### One-transistor driver circuit
+
+Instead of connecting the antenna directly to the GPIO, use the GPIO to
+switch a transistor that drives the antenna from the 5 V USB rail (VBUS):
+
+```
+  VBUS 5 V (physical pin 40)
+    │
+   [47–330 Ω, rated 1/2 W]      ← sets the antenna current
+    │
+   Loop antenna (10–20 turns) or tuned ferrite-bar antenna
+    │
+    ├─ drain (collector)
+    │
+GP15 ──[1 kΩ]── gate (base)     2N7000 / IRLZ34N (MOSFET)
+    │                           or 2N2222 / 2SC1815 (NPN)
+    └─ source (emitter) ── GND
+```
+
+Component notes:
+
+- **Transistor**: any logic-level N-channel MOSFET (2N7000 for up to
+  ~100 mA) or a small NPN (2N2222, 2SC1815). With an NPN, the 1 kΩ base
+  resistor is required; with a MOSFET it just damps ringing.
+- **Series resistor**: start with 330 Ω and lower it step by step only if
+  the clock does not receive. 47 Ω gives roughly 100 mA peak — dissipation
+  approaches 0.2 W on average, so use a 1/2 W resistor. Never omit it.
+- **Antenna**: a tuned antenna is far more effective than more current.
+  Resonate the coil with a parallel capacitor at the carrier frequency
+  (C = 1 / ((2πf)² L), see "案 3" above). A tuned ferrite-bar antenna at
+  47–100 Ω typically reaches 1–3 m.
+- Keep `CARRIER_DUTY = 0.5` and reduce it if the signal is stronger than
+  you need.
+
+### Hard limits — do not go further
+
+- Do **not** raise the supply above the 5 V USB rail.
+- Do **not** connect this to an outdoor antenna or any long-wire antenna.
+- Do **not** add further amplification stages. If 1–3 m is not enough,
+  move the transmitter closer to the clock instead.
+- If a neighbor's clock could plausibly pick up your signal, your signal
+  is too strong.
