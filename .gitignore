@@ -1,0 +1,6 @@
+.claude/
+__pycache__/
+*.pyc
+.DS_Store
+# Local config with real Wi-Fi credentials (if you keep one)
+config.local.py
