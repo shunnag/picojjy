@@ -53,6 +53,21 @@ _MARKER_SECONDS = (0, 9, 19, 29, 39, 49, 59)
 
 
 # ---------------------------------------------------------------------------
+# Hardware watchdog
+# ---------------------------------------------------------------------------
+
+# Set in main() when config.WATCHDOG is True.  The RP2040/RP2350 watchdog
+# allows at most ~8.3 s, so every blocking wait below is chopped into
+# pieces short enough to call _feed() in between.
+_wdt = None
+
+
+def _feed():
+    if _wdt:
+        _wdt.feed()
+
+
+# ---------------------------------------------------------------------------
 # NTP-synchronized millisecond clock
 # ---------------------------------------------------------------------------
 
@@ -88,7 +103,9 @@ def ntp_time(server, timeout_s):
     network delay is assumed symmetric, so the anchor is placed at the
     midpoint of the request round trip.
     """
+    _feed()  # DNS lookup and the query below may block for seconds
     addr = socket.getaddrinfo(server, 123)[0][-1]
+    _feed()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -100,6 +117,7 @@ def ntp_time(server, timeout_s):
         t_recv = time.ticks_ms()
     finally:
         sock.close()
+    _feed()
     if len(data) < 48:
         raise OSError("short NTP response")
     # Transmit timestamp: 32-bit seconds + 32-bit fraction, big endian.
@@ -182,6 +200,7 @@ def connect_wifi(led):
                 raise OSError("Wi-Fi connect timeout")
             if led:
                 led.toggle()
+            _feed()
             time.sleep_ms(250)
     if led:
         led.value(0)
@@ -206,6 +225,7 @@ def sync_clock(clock):
         except OSError as exc:
             print("NTP attempt %d/%d failed: %s"
                   % (attempt + 1, config.NTP_RETRIES, exc))
+            _feed()
             time.sleep_ms(1000)
     return False
 
@@ -215,8 +235,19 @@ def sync_clock(clock):
 # ---------------------------------------------------------------------------
 
 def main():
+    global _wdt
     if config.JJY_FREQUENCY_KHZ not in (40, 60):
         raise ValueError("JJY_FREQUENCY_KHZ must be 40 or 60")
+
+    if getattr(config, "WATCHDOG", False):
+        # A single NTP receive must stay comfortably inside the 8 s
+        # watchdog window, since there is no way to feed mid-recvfrom.
+        if config.NTP_TIMEOUT_S > 7:
+            raise ValueError("NTP_TIMEOUT_S must be <= 7 when WATCHDOG is on")
+        # Note: once started, the RP2 watchdog cannot be stopped until
+        # the next reset.
+        _wdt = machine.WDT(timeout=8000)
+        print("Hardware watchdog enabled (8 s timeout)")
 
     led = Pin("LED", Pin.OUT) if config.STATUS_LED else None
     pwm = PWM(Pin(config.ANTENNA_PIN))
@@ -236,8 +267,12 @@ def main():
     def wait_until(target_ms):
         """Block until clock.now_ms() reaches target_ms (ms precision)."""
         remaining = target_ms - clock.now_ms()
-        if remaining > 10:
-            time.sleep_ms(remaining - 10)
+        while remaining > 10:
+            _feed()
+            # Sleep in <=1 s slices so the watchdog stays fed even
+            # across an unexpectedly long wait.
+            time.sleep_ms(min(remaining - 10, 1000))
+            remaining = target_ms - clock.now_ms()
         while clock.now_ms() < target_ms:
             pass
 
@@ -302,7 +337,11 @@ except Exception as exc:
     print("Fatal error:", exc)
     if getattr(config, "RESET_ON_ERROR", True):
         print("Resetting in 10 s...")
-        time.sleep(10)
+        for _ in range(10):
+            _feed()
+            time.sleep(1)
         machine.reset()
     else:
+        # With WATCHDOG enabled the board still resets ~8 s from now,
+        # because nothing feeds the watchdog anymore.
         raise
