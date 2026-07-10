@@ -231,6 +231,81 @@ def sync_clock(clock):
 
 
 # ---------------------------------------------------------------------------
+# Power-save scheduling (battery operation)
+# ---------------------------------------------------------------------------
+
+def parse_windows(specs):
+    """Parse ("HH:MM-HH:MM", ...) into (start, end) seconds-of-day pairs.
+
+    A window whose end is not after its start crosses midnight
+    (e.g. "23:45-00:15").
+    """
+    windows = []
+    for spec in specs:
+        try:
+            start_str, end_str = spec.split("-")
+            sh, sm = [int(x) for x in start_str.split(":")]
+            eh, em = [int(x) for x in end_str.split(":")]
+        except ValueError:
+            raise ValueError("bad window %r, expected 'HH:MM-HH:MM'" % spec)
+        if not (0 <= sh < 24 and 0 <= eh < 24 and 0 <= sm < 60 and 0 <= em < 60):
+            raise ValueError("bad time of day in window %r" % spec)
+        start, end = sh * 3600 + sm * 60, eh * 3600 + em * 60
+        if start == end:
+            raise ValueError("empty window %r" % spec)
+        windows.append((start, end))
+    if not windows:
+        raise ValueError("POWER_SAVE_WINDOWS must not be empty")
+    return windows
+
+
+def window_remaining(windows, sec_of_day):
+    """Seconds left in the window covering sec_of_day, or 0 if outside."""
+    for start, end in windows:
+        length = (end - start) % 86400
+        elapsed = (sec_of_day - start) % 86400
+        if elapsed < length:
+            return length - elapsed
+    return 0
+
+
+def next_window_delta(windows, sec_of_day):
+    """Seconds until the next window start (0 if one starts right now)."""
+    return min((start - sec_of_day) % 86400 for start, _ in windows)
+
+
+def wifi_off(wlan):
+    """Shut the Wi-Fi chip down as far as the port allows."""
+    try:
+        wlan.disconnect()
+    except OSError:
+        pass
+    wlan.active(False)
+    try:
+        wlan.deinit()
+    except (AttributeError, OSError):
+        pass
+
+
+def power_nap(clock, ms):
+    """Light-sleep for `ms` milliseconds, then re-anchor `clock`.
+
+    Depending on the port/firmware version, time.ticks_ms() may or may
+    not advance during machine.lightsleep(), so the clock is re-anchored
+    from our own accounting of the slept time.  The residual error is
+    the lightsleep timer tolerance; callers must re-sync via NTP before
+    trusting the clock for transmission.
+    """
+    wake_utc = clock.now_ms() + ms
+    remaining = ms
+    while remaining > 0:
+        chunk = min(remaining, 60000)
+        machine.lightsleep(chunk)
+        remaining -= chunk
+    clock.set(wake_utc, time.ticks_ms())
+
+
+# ---------------------------------------------------------------------------
 # Main transmit loop
 # ---------------------------------------------------------------------------
 
@@ -238,6 +313,13 @@ def main():
     global _wdt
     if config.JJY_FREQUENCY_KHZ not in (40, 60):
         raise ValueError("JJY_FREQUENCY_KHZ must be 40 or 60")
+
+    power_save = getattr(config, "POWER_SAVE", False)
+    if power_save and getattr(config, "WATCHDOG", False):
+        raise ValueError("POWER_SAVE cannot be combined with WATCHDOG "
+                         "(light sleep stops feeding the watchdog)")
+    # Validate the schedule before doing anything slow.
+    windows = parse_windows(config.POWER_SAVE_WINDOWS) if power_save else None
 
     if getattr(config, "WATCHDOG", False):
         # A single NTP receive must stay comfortably inside the 8 s
@@ -284,51 +366,125 @@ def main():
     resync_ms = config.NTP_RESYNC_MINUTES * 60 * 1000
     last_sync = clock.now_ms()
 
-    print("Transmitting JJY on GPIO%d at %d kHz"
-          % (config.ANTENNA_PIN, config.JJY_FREQUENCY_KHZ))
+    def local_secs():
+        """Local (JST) seconds since the port epoch."""
+        return (clock.now_ms() + offset_ms) // 1000
 
-    frame = None
-    # Index of the next local (JST) second to transmit.
-    next_idx = (clock.now_ms() + offset_ms) // 1000 + 1
+    def transmit(until_lsec):
+        """Run the transmit loop until local second `until_lsec`
+        (forever if None)."""
+        nonlocal wlan, last_sync
+        print("Transmitting JJY on GPIO%d at %d kHz"
+              % (config.ANTENNA_PIN, config.JJY_FREQUENCY_KHZ))
+        frame = None
+        # Index of the next local (JST) second to transmit.
+        next_idx = local_secs() + 1
 
-    while True:
-        sec = next_idx % 60
-        if frame is None or sec == 0:
-            tm = time.gmtime(next_idx)
-            frame = build_frame(tm)
-            if sec == 0:
-                print("Frame %02d:%02d (doy %d)" % (tm[3], tm[4], tm[7]))
+        while until_lsec is None or next_idx < until_lsec:
+            sec = next_idx % 60
+            if frame is None or sec == 0:
+                tm = time.gmtime(next_idx)
+                frame = build_frame(tm)
+                if sec == 0:
+                    print("Frame %02d:%02d (doy %d)" % (tm[3], tm[4], tm[7]))
 
-        boundary = next_idx * 1000 - offset_ms  # UTC ms of second start
-        if boundary - clock.now_ms() < -100:
-            # We fell behind (e.g. a slow NTP re-sync or a backward time
-            # step): realign to the next full second and rebuild.
-            next_idx = (clock.now_ms() + offset_ms) // 1000 + 1
-            frame = None
-            continue
+            boundary = next_idx * 1000 - offset_ms  # UTC ms of second start
+            if boundary - clock.now_ms() < -100:
+                # We fell behind (e.g. a slow NTP re-sync or a backward
+                # time step): realign to the next full second and rebuild.
+                next_idx = local_secs() + 1
+                frame = None
+                continue
 
-        wait_until(boundary)
-        carrier(True)
-        wait_until(boundary + SYMBOL_ON_MS[frame[sec]])
+            wait_until(boundary)
+            carrier(True)
+            wait_until(boundary + SYMBOL_ON_MS[frame[sec]])
+            carrier(False)
+
+            # Housekeeping in the carrier-off tail of second 59, so a
+            # slow NTP query corrupts at most the frame boundary.
+            if sec == 59 and clock.now_ms() - last_sync >= resync_ms:
+                if not wlan.isconnected():
+                    print("Wi-Fi lost, reconnecting...")
+                    try:
+                        wlan = connect_wifi(led)
+                    except OSError as exc:
+                        print("Reconnect failed: %s (free-running)" % exc)
+                if wlan.isconnected() and sync_clock(clock):
+                    last_sync = clock.now_ms()
+                else:
+                    # Keep transmitting on the free-running crystal and
+                    # try again after the next frame.
+                    last_sync += 60 * 1000
+
+            next_idx += 1
         carrier(False)
 
-        # Housekeeping in the carrier-off tail of second 59, so a slow
-        # NTP query corrupts at most the frame boundary.
-        if sec == 59 and clock.now_ms() - last_sync >= resync_ms:
-            if not wlan.isconnected():
-                print("Wi-Fi lost, reconnecting...")
-                try:
-                    wlan = connect_wifi(led)
-                except OSError as exc:
-                    print("Reconnect failed: %s (free-running)" % exc)
-            if wlan.isconnected() and sync_clock(clock):
-                last_sync = clock.now_ms()
-            else:
-                # Keep transmitting on the free-running crystal and try
-                # again after the next frame.
-                last_sync += 60 * 1000
+    if not power_save:
+        transmit(None)  # never returns
+        return
 
-        next_idx += 1
+    # --- Power-save scheduling -------------------------------------------
+    # Transmit during the configured daily windows only; light-sleep with
+    # Wi-Fi off in between and re-sync via NTP on every wake-up.
+
+    def try_resync():
+        """Reconnect Wi-Fi and re-sync the clock after a wake-up."""
+        nonlocal wlan, last_sync
+        try:
+            wlan = connect_wifi(led)
+        except OSError as exc:
+            print("Wi-Fi reconnect failed:", exc)
+            return False
+        if sync_clock(clock):
+            last_sync = clock.now_ms()
+            return True
+        return False
+
+    # Wake this many seconds before a window opens, leaving time to
+    # reconnect Wi-Fi and re-sync (also absorbs lightsleep timer drift).
+    margin_s = 120
+
+    startup_min = getattr(config, "POWER_SAVE_STARTUP_MINUTES", 20)
+    if startup_min > 0:
+        print("Initial run: transmitting for %d min" % startup_min)
+        transmit(local_secs() + startup_min * 60)
+
+    # True while the clock has been NTP-verified since the last sleep.
+    synced = True
+    while True:
+        remaining = window_remaining(windows, local_secs() % 86400)
+        if remaining > 0:
+            if synced:
+                print("Window open for %d s" % remaining)
+                transmit(local_secs() + remaining)
+            elif try_resync():
+                synced = True
+            else:
+                # Never transmit on an unverified clock: a wrong time
+                # signal is worse than none.  Retry while the window
+                # lasts, then give up until the next one.
+                time.sleep(30)
+            continue
+
+        delta = next_window_delta(windows, local_secs() % 86400)
+        nap_s = delta - margin_s
+        if nap_s > 60:
+            t = time.gmtime(local_secs() + delta)
+            print("Sleeping %d s until next window at %02d:%02d"
+                  % (nap_s, t[3], t[4]))
+            wifi_off(wlan)
+            time.sleep_ms(200)  # let the console output drain
+            power_nap(clock, nap_s * 1000)
+            synced = try_resync()
+        elif not synced:
+            synced = try_resync()
+            if not synced:
+                time.sleep(30)
+        else:
+            # Inside the wake margin with a verified clock: idle briefly
+            # until the window opens.
+            time.sleep_ms(min(delta, 10) * 1000)
 
 
 try:
