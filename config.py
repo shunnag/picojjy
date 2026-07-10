@@ -29,6 +29,22 @@ CARRIER_DUTY = 0.5
 # radio-controlled clocks sold for the Japanese market.
 TIME_OFFSET_HOURS = 9
 
+# --- Power save (battery operation) -----------------------------------------
+# Transmit only during the daily windows below and light-sleep with
+# Wi-Fi off in between (a few mA instead of ~70 mA).  The clock is
+# re-synced via NTP on every wake-up.  Cannot be combined with WATCHDOG.
+# The USB serial console stops during light sleep, so keep this False
+# while developing.
+POWER_SAVE = False
+# Right after power-on, transmit continuously for this many minutes
+# (time to place and force-sync your clocks) before the schedule starts.
+POWER_SAVE_STARTUP_MINUTES = 20
+# Daily transmit windows in local time, "HH:MM-HH:MM" each.  A window
+# may cross midnight.  Most Japanese radio-controlled clocks attempt
+# automatic reception around midnight and/or noon, so the defaults
+# cover both.
+POWER_SAVE_WINDOWS = ("11:45-12:15", "23:45-00:15")
+
 # --- Misc ------------------------------------------------------------------
 # Blink the onboard LED in sync with the transmitted symbols.
 STATUS_LED = True

@@ -42,6 +42,9 @@ Wi-Fi 経由で NTP サーバー(デフォルト: `ntp.nict.jp`)から正確な�
 | `STATUS_LED` | `True` | オンボード LED を送信シンボルに同期して点滅させる |
 | `RESET_ON_ERROR` | `True` | 回復不能なエラー時に 10 秒後に自動リセットする |
 | `WATCHDOG` | `False` | ハードウェアウォッチドッグ(8 秒)を有効化。例外にならないハングからも自動復帰する。開発中は `False` 推奨(詳細は [INSTALL.md](docs/INSTALL.md)) |
+| `POWER_SAVE` | `False` | 省エネモード。送信ウィンドウ以外は Wi-Fi を切って lightsleep で待機(電池運用向け)。`WATCHDOG` とは併用不可 |
+| `POWER_SAVE_STARTUP_MINUTES` | `20` | 電源投入直後に連続送信する時間(分)。時計の設置・強制受信用 |
+| `POWER_SAVE_WINDOWS` | `("11:45-12:15", "23:45-00:15")` | 毎日の送信ウィンドウ(ローカル時刻、日跨ぎ可) |
 
 ## 周波数の選び方
 
