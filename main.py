@@ -330,12 +330,18 @@ def next_window_delta(windows, sec_of_day):
 
 
 def wifi_off(wlan):
-    """Shut the Wi-Fi chip down as far as the port allows."""
+    """Shut the Wi-Fi chip down as far as the port allows.
+
+    Safe to call again on an already stopped interface.
+    """
     try:
         wlan.disconnect()
     except OSError:
         pass
-    wlan.active(False)
+    try:
+        wlan.active(False)
+    except OSError:
+        pass
     try:
         wlan.deinit()
     except (AttributeError, OSError):
@@ -375,6 +381,9 @@ def main():
                          "(light sleep stops feeding the watchdog)")
     # Validate the schedule before doing anything slow.
     windows = parse_windows(config.POWER_SAVE_WINDOWS) if power_save else None
+    slow_mhz = getattr(config, "POWER_SAVE_CPU_MHZ", 0)
+    if power_save and slow_mhz and not 20 <= slow_mhz <= 150:
+        raise ValueError("POWER_SAVE_CPU_MHZ must be 0 or 20..150")
 
     if getattr(config, "WATCHDOG", False):
         # A single NTP receive must stay comfortably inside the 8 s
@@ -426,9 +435,14 @@ def main():
         """Local (JST) seconds since the port epoch."""
         return (clock.now_ms() + offset_ms) // 1000
 
-    def transmit(until_lsec):
+    def transmit(until_lsec, offline=False):
         """Run the transmit loop until local second `until_lsec`
-        (forever if None)."""
+        (forever if None).
+
+        With offline=True no re-sync/reconnect housekeeping runs: the
+        caller has intentionally turned Wi-Fi off and the loop free-runs
+        on the crystal (~30 ppm, a few ms over a 30-min window).
+        """
         nonlocal wlan, last_sync
         print("Transmitting JJY on GPIO%d at %d kHz"
               % (config.ANTENNA_PIN, config.JJY_FREQUENCY_KHZ))
@@ -463,7 +477,8 @@ def main():
             # is 250 ms and Wi-Fi reconnects associate in the
             # background, so the next second's edge is never delayed:
             # the signal keeps running through re-syncs and outages.
-            if sec % 10 == 9 and clock.now_ms() - last_sync >= resync_ms:
+            if (not offline and sec % 10 == 9
+                    and clock.now_ms() - last_sync >= resync_ms):
                 if wlan.isconnected():
                     res = ntp.query(250)
                     if res:
@@ -498,6 +513,35 @@ def main():
     # Transmit during the configured daily windows only; light-sleep with
     # Wi-Fi off in between and re-sync via NTP on every wake-up.
 
+    default_freq = machine.freq()
+
+    def set_cpu(slow):
+        """Down-clock the core for offline transmission, or restore the
+        default clock (required before the Wi-Fi driver is used)."""
+        if not slow_mhz:
+            return
+        target = slow_mhz * 1000000 if slow else default_freq
+        if machine.freq() != target:
+            machine.freq(target)
+            # The PWM divider is derived from the system clock:
+            # reprogram the carrier and leave it off.
+            pwm.freq(config.JJY_FREQUENCY_KHZ * 1000)
+            pwm.duty_u16(0)
+
+    def transmit_window(duration_s):
+        """Transmit for duration_s seconds, going offline (Wi-Fi off,
+        CPU down-clocked) when the window is short enough to free-run
+        on the crystal without a mid-window re-sync."""
+        offline = duration_s <= config.NTP_RESYNC_MINUTES * 60
+        if offline:
+            print("Going offline for this window (Wi-Fi off%s)"
+                  % (", CPU %d MHz" % slow_mhz if slow_mhz else ""))
+            ntp.close()
+            wifi_off(wlan)
+            set_cpu(True)
+        transmit(local_secs() + duration_s, offline)
+        set_cpu(False)
+
     def try_resync():
         """Reconnect Wi-Fi and re-sync the clock after a wake-up."""
         nonlocal wlan, last_sync
@@ -518,7 +562,7 @@ def main():
     startup_min = getattr(config, "POWER_SAVE_STARTUP_MINUTES", 20)
     if startup_min > 0:
         print("Initial run: transmitting for %d min" % startup_min)
-        transmit(local_secs() + startup_min * 60)
+        transmit_window(startup_min * 60)
 
     # True while the clock has been NTP-verified since the last sleep.
     synced = True
@@ -527,7 +571,7 @@ def main():
         if remaining > 0:
             if synced:
                 print("Window open for %d s" % remaining)
-                transmit(local_secs() + remaining)
+                transmit_window(remaining)
             elif try_resync():
                 synced = True
             else:

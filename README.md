@@ -46,6 +46,7 @@ Wi-Fi 経由で NTP サーバー(デフォルト: `ntp.nict.jp`)から正確な�
 | `POWER_SAVE` | `False` | 省エネモード。送信ウィンドウ以外は Wi-Fi を切って lightsleep で待機(電池運用向け)。`WATCHDOG` とは併用不可 |
 | `POWER_SAVE_STARTUP_MINUTES` | `20` | 電源投入直後に連続送信する時間(分)。時計の設置・強制受信用 |
 | `POWER_SAVE_WINDOWS` | `("11:45-12:15", "23:45-00:15")` | 毎日の送信ウィンドウ(ローカル時刻、日跨ぎ可) |
+| `POWER_SAVE_CPU_MHZ` | `48` | 省エネモードの送信中に Wi-Fi を切った上で CPU をこの周波数(MHz)に下げる。`0` でクロック変更なし |
 
 ## 周波数の選び方
 
