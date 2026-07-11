@@ -95,37 +95,92 @@ class SyncedClock:
                                                  self._anchor_ticks)
 
 
-def ntp_time(server, timeout_s):
-    """Query an NTP server once.
+class NTPClient:
+    """NTP client with a bounded, non-blocking query.
 
-    Returns (utc_ms, anchor_ticks): the server time in UTC milliseconds
-    (port epoch) and the local ticks_ms() value it corresponds to.  The
-    network delay is assumed symmetric, so the anchor is placed at the
-    midpoint of the request round trip.
+    query() polls a non-blocking socket for at most `budget_ms`, so a
+    call fits inside the carrier-off tail of a JJY second and the
+    transmission never stalls on a slow server or a dead network.  The
+    server address is cached, so the (blocking) DNS lookup normally
+    happens only on the very first call.
     """
-    _feed()  # DNS lookup and the query below may block for seconds
-    addr = socket.getaddrinfo(server, 123)[0][-1]
-    _feed()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.settimeout(timeout_s)
-        pkt = bytearray(48)
-        pkt[0] = 0x1B  # LI=0, VN=3, Mode=3 (client)
-        t_send = time.ticks_ms()
-        sock.sendto(pkt, addr)
-        data, _ = sock.recvfrom(48)
-        t_recv = time.ticks_ms()
-    finally:
-        sock.close()
-    _feed()
-    if len(data) < 48:
-        raise OSError("short NTP response")
-    # Transmit timestamp: 32-bit seconds + 32-bit fraction, big endian.
-    secs, frac = struct.unpack("!II", data[40:48])
-    utc_ms = (secs - NTP_DELTA) * 1000 + (frac * 1000 >> 32)
-    rtt = time.ticks_diff(t_recv, t_send)
-    anchor_ticks = time.ticks_add(t_send, rtt // 2)
-    return utc_ms, anchor_ticks
+
+    def __init__(self, server):
+        self.server = server
+        self._addr = None
+        self._sock = None
+        self._failures = 0
+
+    def _setup(self):
+        if self._addr is None:
+            _feed()  # DNS resolution may block for a while
+            self._addr = socket.getaddrinfo(self.server, 123,
+                                            socket.AF_INET,
+                                            socket.SOCK_DGRAM)[0][-1]
+        if self._sock is None:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setblocking(False)
+
+    def _note_failure(self):
+        self._failures += 1
+        if self._failures >= 10:
+            # Repeated failures: the server address may have changed,
+            # force a fresh DNS lookup on the next attempt.
+            self._addr = None
+            self._failures = 0
+
+    def close(self):
+        """Drop the socket (call before Wi-Fi is torn down)."""
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+
+    def query(self, budget_ms):
+        """One query attempt, waiting at most budget_ms for the reply.
+
+        Returns (utc_ms, anchor_ticks) — the server time in UTC
+        milliseconds (port epoch) and the ticks_ms() value it
+        corresponds to (midpoint of the round trip, assuming a symmetric
+        network delay) — or None on timeout/error.  A reply that arrives
+        after the budget is drained and discarded on the next call: its
+        round trip cannot be measured, so anchoring the clock to it
+        would be wrong.
+        """
+        try:
+            self._setup()
+            # Drain any stale reply from a previous, timed-out attempt.
+            while True:
+                try:
+                    self._sock.recvfrom(48)
+                except OSError:
+                    break
+            pkt = bytearray(48)
+            pkt[0] = 0x1B  # LI=0, VN=3, Mode=3 (client)
+            _feed()
+            t_send = time.ticks_ms()
+            self._sock.sendto(pkt, self._addr)
+            deadline = time.ticks_add(t_send, budget_ms)
+            while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+                try:
+                    data, _ = self._sock.recvfrom(48)
+                except OSError:  # EAGAIN: no reply yet
+                    _feed()
+                    time.sleep_ms(2)
+                    continue
+                t_recv = time.ticks_ms()
+                if len(data) < 48:
+                    continue
+                # Transmit timestamp: 32-bit seconds + fraction, big endian.
+                secs, frac = struct.unpack("!II", data[40:48])
+                utc_ms = (secs - NTP_DELTA) * 1000 + (frac * 1000 >> 32)
+                rtt = time.ticks_diff(t_recv, t_send)
+                self._failures = 0
+                return utc_ms, time.ticks_add(t_send, rtt // 2)
+        except OSError as exc:
+            print("NTP query error:", exc)
+            self.close()
+        self._note_failure()
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -208,25 +263,25 @@ def connect_wifi(led):
     return wlan
 
 
-def sync_clock(clock):
-    """Sync `clock` from the configured NTP server, with retries.
+def sync_clock(ntp, clock):
+    """Sync `clock` from the NTP server, with retries.
 
-    Returns True on success, False if every attempt failed.
+    Used at start-up and after power-save wake-ups, where blocking for a
+    few seconds is fine.  Returns True on success.
     """
     for attempt in range(config.NTP_RETRIES):
-        try:
-            utc_ms, anchor = ntp_time(config.NTP_SERVER, config.NTP_TIMEOUT_S)
-            clock.set(utc_ms, anchor)
-            t = time.gmtime(utc_ms // 1000
+        res = ntp.query(config.NTP_TIMEOUT_S * 1000)
+        if res:
+            clock.set(*res)
+            t = time.gmtime(res[0] // 1000
                             + config.TIME_OFFSET_HOURS * 3600)
             print("NTP sync OK: %04d-%02d-%02d %02d:%02d:%02d (local)"
                   % (t[0], t[1], t[2], t[3], t[4], t[5]))
             return True
-        except OSError as exc:
-            print("NTP attempt %d/%d failed: %s"
-                  % (attempt + 1, config.NTP_RETRIES, exc))
-            _feed()
-            time.sleep_ms(1000)
+        print("NTP attempt %d/%d failed"
+              % (attempt + 1, config.NTP_RETRIES))
+        _feed()
+        time.sleep_ms(1000)
     return False
 
 
@@ -358,8 +413,9 @@ def main():
         while clock.now_ms() < target_ms:
             pass
 
+    ntp = NTPClient(config.NTP_SERVER)
     wlan = connect_wifi(led)
-    if not sync_clock(clock):
+    if not sync_clock(ntp, clock):
         raise OSError("initial NTP sync failed")
 
     offset_ms = config.TIME_OFFSET_HOURS * 3600 * 1000
@@ -377,6 +433,7 @@ def main():
         print("Transmitting JJY on GPIO%d at %d kHz"
               % (config.ANTENNA_PIN, config.JJY_FREQUENCY_KHZ))
         frame = None
+        wifi_kick = None  # ticks_ms of the last background reconnect
         # Index of the next local (JST) second to transmit.
         next_idx = local_secs() + 1
 
@@ -401,21 +458,34 @@ def main():
             wait_until(boundary + SYMBOL_ON_MS[frame[sec]])
             carrier(False)
 
-            # Housekeeping in the carrier-off tail of second 59, so a
-            # slow NTP query corrupts at most the frame boundary.
-            if sec == 59 and clock.now_ms() - last_sync >= resync_ms:
-                if not wlan.isconnected():
-                    print("Wi-Fi lost, reconnecting...")
+            # Re-sync housekeeping runs in the 0.8 s carrier-off tail
+            # of marker seconds (9, 19, ... 59).  The NTP query budget
+            # is 250 ms and Wi-Fi reconnects associate in the
+            # background, so the next second's edge is never delayed:
+            # the signal keeps running through re-syncs and outages.
+            if sec % 10 == 9 and clock.now_ms() - last_sync >= resync_ms:
+                if wlan.isconnected():
+                    res = ntp.query(250)
+                    if res:
+                        clock.set(*res)
+                        last_sync = clock.now_ms()
+                        wifi_kick = None
+                        print("NTP re-sync OK")
+                    else:
+                        # Free-run on the crystal and retry in ~1 min
+                        # (keeps the query rate polite during outages).
+                        last_sync += 60 * 1000
+                elif (wifi_kick is None or
+                      time.ticks_diff(time.ticks_ms(), wifi_kick) > 30000):
+                    # Kick a non-blocking reconnect; the cyw43 driver
+                    # associates in the background while we transmit.
+                    print("Wi-Fi lost, reconnecting in background...")
                     try:
-                        wlan = connect_wifi(led)
+                        wlan.active(True)
+                        wlan.connect(config.WIFI_SSID, config.WIFI_PASSWORD)
                     except OSError as exc:
-                        print("Reconnect failed: %s (free-running)" % exc)
-                if wlan.isconnected() and sync_clock(clock):
-                    last_sync = clock.now_ms()
-                else:
-                    # Keep transmitting on the free-running crystal and
-                    # try again after the next frame.
-                    last_sync += 60 * 1000
+                        print("Reconnect failed:", exc)
+                    wifi_kick = time.ticks_ms()
 
             next_idx += 1
         carrier(False)
@@ -436,7 +506,7 @@ def main():
         except OSError as exc:
             print("Wi-Fi reconnect failed:", exc)
             return False
-        if sync_clock(clock):
+        if sync_clock(ntp, clock):
             last_sync = clock.now_ms()
             return True
         return False
@@ -473,6 +543,7 @@ def main():
             t = time.gmtime(local_secs() + delta)
             print("Sleeping %d s until next window at %02d:%02d"
                   % (nap_s, t[3], t[4]))
+            ntp.close()  # the socket does not survive the Wi-Fi teardown
             wifi_off(wlan)
             time.sleep_ms(200)  # let the console output drain
             power_nap(clock, nap_s * 1000)
