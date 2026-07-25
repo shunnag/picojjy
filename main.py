@@ -17,6 +17,8 @@ on-off keying is decoded fine by consumer clocks.
 All user settings live in config.py.
 """
 
+import gc
+import select
 import struct
 import time
 
@@ -24,6 +26,7 @@ import machine
 import network
 import socket
 from machine import Pin, PWM
+from micropython import const
 
 import config
 
@@ -35,8 +38,19 @@ import config
 # epoch.  Embedded MicroPython ports use 2000-01-01, others 1970-01-01.
 NTP_DELTA = 3155673600 if time.gmtime(0)[0] == 2000 else 2208988800
 
-# Carrier-ON duration in milliseconds for each JJY symbol.
-SYMBOL_ON_MS = {"M": 200, 1: 500, 0: 800}
+
+def _ntp_utc_ms(secs, frac):
+    """NTP timestamp (32-bit seconds since 1900 + 32-bit fraction) to
+    UTC milliseconds since the port epoch."""
+    return (secs - NTP_DELTA) * 1000 + (frac * 1000 >> 32)
+
+# Frame symbol codes: 0 and 1 are data bits, _MARK is a position
+# marker (the "M" of the JJY code).
+_MARK = const(2)
+
+# Carrier-ON duration in milliseconds, indexed by frame symbol
+# (0 -> 800 ms, 1 -> 500 ms, _MARK -> 200 ms).
+SYMBOL_ON_MS = (800, 500, 200)
 
 # (second-in-frame, BCD weight) pairs for each field of the JJY frame.
 _MINUTE_SLOTS = ((1, 40), (2, 20), (3, 10), (5, 8), (6, 4), (7, 2), (8, 1))
@@ -76,9 +90,14 @@ class SyncedClock:
 
     The NTP result is tied to a time.ticks_ms() reading, so the current
     time can be read at any moment without touching the network.  The
-    Pico crystal (~30 ppm) drifts only a few ms per hour, which is well
-    within what radio-controlled clocks tolerate; periodic re-syncs keep
-    the error bounded.
+    Pico crystal drifts up to ~110 ms per hour at its +-30 ppm spec
+    (typically a few tens of ms), which is well within what
+    radio-controlled clocks tolerate; periodic re-syncs keep the error
+    bounded.
+
+    On 32-bit builds now_ms() values (~8e11) are heap-allocated big
+    ints, so the timing-critical wait uses ticks_at() to convert the
+    target once and then compares raw ticks, allocation-free.
     """
 
     def __init__(self):
@@ -93,6 +112,24 @@ class SyncedClock:
         """UTC milliseconds since the port epoch."""
         return self._anchor_ms + time.ticks_diff(time.ticks_ms(),
                                                  self._anchor_ticks)
+
+    def ticks_at(self, utc_ms):
+        """The time.ticks_ms() value at which the clock reads utc_ms.
+
+        ticks_add() raises OverflowError once |utc_ms - anchor| reaches
+        2^29 ms (~6.2 days); re_anchor() is called every marker second
+        during transmission to keep the anchor far inside that (and
+        with RESET_ON_ERROR the exception means a clean reset, not a
+        corrupted signal).
+        """
+        return time.ticks_add(self._anchor_ticks,
+                              utc_ms - self._anchor_ms)
+
+    def re_anchor(self):
+        """Move the anchor to now without changing the clock reading."""
+        t = time.ticks_ms()
+        self._anchor_ms += time.ticks_diff(t, self._anchor_ticks)
+        self._anchor_ticks = t
 
 
 class NTPClient:
@@ -110,16 +147,25 @@ class NTPClient:
         self._addr = None
         self._sock = None
         self._failures = 0
+        self._poll = select.poll()
+        self._req = bytearray(48)
+        self._req[0] = 0x1B  # LI=0, VN=3, Mode=3 (client)
 
     def _setup(self):
         if self._addr is None:
-            _feed()  # DNS resolution may block for a while
+            # DNS may block for seconds.  On the bounded in-transmit
+            # path this only happens after 10 consecutive failures
+            # (forced re-DNS); the realign logic absorbs the overrun,
+            # and refusing DNS here would permanently lose NTP in
+            # continuous mode.
+            _feed()
             self._addr = socket.getaddrinfo(self.server, 123,
                                             socket.AF_INET,
                                             socket.SOCK_DGRAM)[0][-1]
         if self._sock is None:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._sock.setblocking(False)
+            self._poll.register(self._sock, select.POLLIN)
 
     def _note_failure(self):
         self._failures += 1
@@ -132,6 +178,13 @@ class NTPClient:
     def close(self):
         """Drop the socket (call before Wi-Fi is torn down)."""
         if self._sock:
+            # unregister of an unknown object is currently a silent
+            # no-op; guarded in case future firmware raises like
+            # CPython does.
+            try:
+                self._poll.unregister(self._sock)
+            except (OSError, KeyError):
+                pass
             self._sock.close()
             self._sock = None
 
@@ -149,30 +202,28 @@ class NTPClient:
         try:
             self._setup()
             # Drain any stale reply from a previous, timed-out attempt.
-            while True:
-                try:
-                    self._sock.recvfrom(48)
-                except OSError:
-                    break
-            pkt = bytearray(48)
-            pkt[0] = 0x1B  # LI=0, VN=3, Mode=3 (client)
+            while self._poll.poll(0):
+                self._sock.recvfrom(48)
             _feed()
             t_send = time.ticks_ms()
-            self._sock.sendto(pkt, self._addr)
+            self._sock.sendto(self._req, self._addr)
             deadline = time.ticks_add(t_send, budget_ms)
-            while time.ticks_diff(deadline, time.ticks_ms()) > 0:
-                try:
-                    data, _ = self._sock.recvfrom(48)
-                except OSError:  # EAGAIN: no reply yet
-                    _feed()
-                    time.sleep_ms(2)
+            while True:
+                remaining = time.ticks_diff(deadline, time.ticks_ms())
+                if remaining <= 0:
+                    break
+                _feed()
+                # poll() waits event-driven instead of waking every
+                # few ms; the 500 ms cap keeps the watchdog fed.
+                if not self._poll.poll(min(remaining, 500)):
                     continue
+                data, _ = self._sock.recvfrom(48)
                 t_recv = time.ticks_ms()
                 if len(data) < 48:
                     continue
                 # Transmit timestamp: 32-bit seconds + fraction, big endian.
-                secs, frac = struct.unpack("!II", data[40:48])
-                utc_ms = (secs - NTP_DELTA) * 1000 + (frac * 1000 >> 32)
+                secs, frac = struct.unpack_from("!II", data, 40)
+                utc_ms = _ntp_utc_ms(secs, frac)
                 rtt = time.ticks_diff(t_recv, t_send)
                 self._failures = 0
                 return utc_ms, time.ticks_add(t_send, rtt // 2)
@@ -198,11 +249,14 @@ def _bcd_bit(value, weight):
     return 1 if digit & mask else 0
 
 
-def build_frame(tm):
-    """Build one 60-symbol JJY frame for the minute given by `tm`.
+def build_frame(tm, frame):
+    """Fill `frame` with one 60-symbol JJY frame for the minute `tm`.
 
     `tm` is a time.gmtime() tuple of the JST time at the start of the
-    minute.  Entries are "M" (marker), 0 or 1.
+    minute; `frame` is a caller-supplied 60-byte buffer, returned for
+    convenience.  Entries are _MARK (marker), 0 or 1.  The caller
+    reuses one buffer across minutes, so holders of a previous frame
+    see it change.
 
     Simplification: the call-sign / service-interruption variant that
     real JJY transmits during minutes 15 and 45 is not reproduced;
@@ -213,28 +267,54 @@ def build_frame(tm):
     yday = tm[7]
     dow = (tm[6] + 1) % 7  # gmtime: 0=Monday -> JJY: 0=Sunday
 
-    frame = [0] * 60
+    # Every position not written below must transmit 0 (gap seconds,
+    # status bits, leap-second bits).
+    for i in range(60):
+        frame[i] = 0
     for sec in _MARKER_SECONDS:
-        frame[sec] = "M"
+        frame[sec] = _MARK
+    # PA1 / PA2 (36 / 37): even parity over the hour / minute bits,
+    # accumulated while the slots are filled (XOR of 0/1 == sum % 2).
+    p = 0
     for sec, w in _MINUTE_SLOTS:
-        frame[sec] = _bcd_bit(minute, w)
+        b = _bcd_bit(minute, w)
+        frame[sec] = b
+        p ^= b
+    frame[37] = p
+    p = 0
     for sec, w in _HOUR_SLOTS:
-        frame[sec] = _bcd_bit(hour, w)
+        b = _bcd_bit(hour, w)
+        frame[sec] = b
+        p ^= b
+    frame[36] = p
     for sec, w in _YDAY_SLOTS:
         frame[sec] = _bcd_bit(yday, w)
     for sec, w in _YEAR_SLOTS:
         frame[sec] = _bcd_bit(year % 100, w)
     for sec, w in _DOW_SLOTS:
         frame[sec] = _bcd_bit(dow, w)
-    # PA1 / PA2: even parity over the hour / minute bits.
-    frame[36] = sum(frame[s] for s, _ in _HOUR_SLOTS) % 2
-    frame[37] = sum(frame[s] for s, _ in _MINUTE_SLOTS) % 2
     return frame
 
 
 # ---------------------------------------------------------------------------
 # Wi-Fi / NTP helpers
 # ---------------------------------------------------------------------------
+
+# cyw43 power management: association and the blocking syncs run with
+# power save off (0xA11140) for short round trips; wifi_pm_save() then
+# drops the radio to PM_PERFORMANCE -- an idle associated radio goes
+# from ~40-50 mA to a few mA on average.  The constant was added in
+# MicroPython v1.21; the raw value covers older firmware.
+_PM_PERFORMANCE = getattr(network.WLAN, "PM_PERFORMANCE", 0xA11142)
+
+
+def wifi_pm_save(wlan):
+    """Switch Wi-Fi to its power-managed mode (best effort)."""
+    try:
+        wlan.config(pm=_PM_PERFORMANCE)
+    except (ValueError, OSError):
+        pass
+
 
 def connect_wifi(led):
     """Bring up the Wi-Fi station interface, blocking until connected."""
@@ -280,8 +360,9 @@ def sync_clock(ntp, clock):
             return True
         print("NTP attempt %d/%d failed"
               % (attempt + 1, config.NTP_RETRIES))
-        _feed()
-        time.sleep_ms(1000)
+        if attempt + 1 < config.NTP_RETRIES:
+            _feed()
+            time.sleep_ms(1000)
     return False
 
 
@@ -360,6 +441,8 @@ def power_nap(clock, ms):
     wake_utc = clock.now_ms() + ms
     remaining = ms
     while remaining > 0:
+        # Chunk to <=60 s per call: long lightsleeps hang or misbehave
+        # on some rp2 firmware (micropython#9006, #15622, #16519).
         chunk = min(remaining, 60000)
         machine.lightsleep(chunk)
         remaining -= chunk
@@ -375,8 +458,12 @@ def main():
     if config.JJY_FREQUENCY_KHZ not in (40, 60):
         raise ValueError("JJY_FREQUENCY_KHZ must be 40 or 60")
 
+    # Options added after the first release are read with getattr()
+    # defaults, so an older, already-edited config.py keeps working
+    # after a main.py upgrade.  Add new options the same way.
     power_save = getattr(config, "POWER_SAVE", False)
-    if power_save and getattr(config, "WATCHDOG", False):
+    watchdog = getattr(config, "WATCHDOG", False)
+    if power_save and watchdog:
         raise ValueError("POWER_SAVE cannot be combined with WATCHDOG "
                          "(light sleep stops feeding the watchdog)")
     # Validate the schedule before doing anything slow.
@@ -385,7 +472,7 @@ def main():
     if power_save and slow_mhz and not 20 <= slow_mhz <= 150:
         raise ValueError("POWER_SAVE_CPU_MHZ must be 0 or 20..150")
 
-    if getattr(config, "WATCHDOG", False):
+    if watchdog:
         # A single NTP receive must stay comfortably inside the 8 s
         # watchdog window, since there is no way to feed mid-recvfrom.
         if config.NTP_TIMEOUT_S > 7:
@@ -411,21 +498,35 @@ def main():
     clock = SyncedClock()
 
     def wait_until(target_ms):
-        """Block until clock.now_ms() reaches target_ms (ms precision)."""
-        remaining = target_ms - clock.now_ms()
-        while remaining > 10:
+        """Block until clock.now_ms() reaches target_ms (ms precision).
+
+        Converts the target to the ticks domain once and then works on
+        small ints only: the pre-edge spin performs no heap allocation,
+        so it can never trigger a GC pause on the second edge.
+        """
+        target = clock.ticks_at(target_ms)
+        while True:
+            remaining = time.ticks_diff(target, time.ticks_ms())
+            if remaining <= 10:
+                break
             _feed()
             # Sleep in <=1 s slices so the watchdog stays fed even
             # across an unexpectedly long wait.
             time.sleep_ms(min(remaining - 10, 1000))
-            remaining = target_ms - clock.now_ms()
-        while clock.now_ms() < target_ms:
+        while time.ticks_diff(target, time.ticks_ms()) > 0:
             pass
 
     ntp = NTPClient(config.NTP_SERVER)
     wlan = connect_wifi(led)
     if not sync_clock(ntp, clock):
         raise OSError("initial NTP sync failed")
+    wifi_pm_save(wlan)
+    # Setup garbage is dead now; one collect leaves a clean contiguous
+    # free region behind the long-lived objects, and the raised
+    # threshold makes any stray automatic GC run early (short pause)
+    # instead of on heap exhaustion (long pause).
+    gc.collect()
+    gc.threshold(gc.mem_free() // 4 + gc.mem_alloc())
 
     offset_ms = config.TIME_OFFSET_HOURS * 3600 * 1000
     resync_ms = config.NTP_RESYNC_MINUTES * 60 * 1000
@@ -441,12 +542,15 @@ def main():
 
         With offline=True no re-sync/reconnect housekeeping runs: the
         caller has intentionally turned Wi-Fi off and the loop free-runs
-        on the crystal (~30 ppm, a few ms over a 30-min window).
+        on the crystal (+-30 ppm: worst case ~54 ms over the default
+        30-min windows, up to ~110 ms if a window fills the full
+        NTP_RESYNC_MINUTES).
         """
         nonlocal wlan, last_sync
         print("Transmitting JJY on GPIO%d at %d kHz"
               % (config.ANTENNA_PIN, config.JJY_FREQUENCY_KHZ))
         frame = None
+        buf = bytearray(60)  # reused by build_frame (no per-minute alloc)
         wifi_kick = None  # ticks_ms of the last background reconnect
         # Index of the next local (JST) second to transmit.
         next_idx = local_secs() + 1
@@ -455,7 +559,7 @@ def main():
             sec = next_idx % 60
             if frame is None or sec == 0:
                 tm = time.gmtime(next_idx)
-                frame = build_frame(tm)
+                frame = build_frame(tm, buf)
                 if sec == 0:
                     print("Frame %02d:%02d (doy %d)" % (tm[3], tm[4], tm[7]))
 
@@ -472,48 +576,89 @@ def main():
             wait_until(boundary + SYMBOL_ON_MS[frame[sec]])
             carrier(False)
 
-            # Re-sync housekeeping runs in the 0.8 s carrier-off tail
-            # of marker seconds (9, 19, ... 59).  The NTP query budget
+            # Housekeeping runs in the 0.8 s carrier-off tail of
+            # marker seconds (9, 19, ... 59).  The NTP query budget
             # is 250 ms and Wi-Fi reconnects associate in the
             # background, so the next second's edge is never delayed:
             # the signal keeps running through re-syncs and outages.
-            if (not offline and sec % 10 == 9
-                    and clock.now_ms() - last_sync >= resync_ms):
-                if wlan.isconnected():
-                    res = ntp.query(250)
-                    if res:
-                        clock.set(*res)
-                        last_sync = clock.now_ms()
-                        wifi_kick = None
-                        print("NTP re-sync OK")
-                    else:
-                        # Free-run on the crystal and retry in ~1 min
-                        # (keeps the query rate polite during outages).
-                        last_sync += 60 * 1000
-                elif (wifi_kick is None or
-                      time.ticks_diff(time.ticks_ms(), wifi_kick) > 30000):
-                    # Kick a non-blocking reconnect; the cyw43 driver
-                    # associates in the background while we transmit.
-                    print("Wi-Fi lost, reconnecting in background...")
-                    try:
-                        wlan.active(True)
-                        wlan.connect(config.WIFI_SSID, config.WIFI_PASSWORD)
-                    except OSError as exc:
-                        print("Reconnect failed:", exc)
-                    wifi_kick = time.ticks_ms()
+            if sec % 10 == 9:
+                # Keep the anchor fresh: wait_until() works in the
+                # ticks domain, which is valid only while the anchor
+                # is well under 2^29 ms (~6.2 days) old.
+                clock.re_anchor()
+                if (not offline
+                        and clock.now_ms() - last_sync >= resync_ms):
+                    if wlan.isconnected():
+                        res = ntp.query(250)
+                        if res:
+                            clock.set(*res)
+                            last_sync = clock.now_ms()
+                            wifi_kick = None
+                            print("NTP re-sync OK")
+                        else:
+                            # Free-run on the crystal and retry in
+                            # ~1 min (keeps the query rate polite
+                            # during outages).
+                            last_sync += 60 * 1000
+                    elif (wifi_kick is None or
+                          time.ticks_diff(time.ticks_ms(),
+                                          wifi_kick) > 30000):
+                        # Kick a non-blocking reconnect; the cyw43
+                        # driver associates in the background while
+                        # we transmit.
+                        print("Wi-Fi lost, reconnecting in background...")
+                        try:
+                            wlan.active(True)
+                            wlan.connect(config.WIFI_SSID,
+                                         config.WIFI_PASSWORD)
+                        except OSError as exc:
+                            print("Reconnect failed:", exc)
+                        wifi_kick = time.ticks_ms()
+                # Collect in dead time (1-5 ms here vs 800 ms budget),
+                # so a GC pause can never land on a second edge.
+                _feed()
+                gc.collect()
 
             next_idx += 1
         carrier(False)
 
     if not power_save:
         transmit(None)  # never returns
-        return
+        return  # defensive: the scheduler below assumes power_save
 
     # --- Power-save scheduling -------------------------------------------
     # Transmit during the configured daily windows only; light-sleep with
     # Wi-Fi off in between and re-sync via NTP on every wake-up.
 
     default_freq = machine.freq()
+    wifi_down = False  # NTP socket closed and Wi-Fi chip shut down
+
+    def wifi_drop():
+        """Tear down NTP + Wi-Fi once; repeat calls are no-ops.
+
+        disconnect()/active(False) on a deinit-ed chip would power it
+        back up (cyw43_ensure_up), so the teardown must not repeat.
+        """
+        nonlocal wifi_down
+        if wifi_down:
+            return
+        ntp.close()  # the socket does not survive the Wi-Fi teardown
+        wifi_off(wlan)
+        wifi_down = True
+
+    def next_window_offline(sod):
+        """True if the window about to open will transmit offline on
+        the current NTP budget (mirrors transmit_window's decision).
+
+        A wrong prediction is self-healing: transmit_window brings
+        Wi-Fi back up when it decides to run online."""
+        delta = next_window_delta(windows, sod)
+        for start, end in windows:
+            if (start - sod) % 86400 == delta:
+                need_ms = (((end - start) % 86400 + delta) * 1000
+                           + clock.now_ms() - last_sync)
+                return need_ms <= resync_ms
+        return False
 
     def set_cpu(slow):
         """Down-clock the core for offline transmission, or restore the
@@ -530,21 +675,39 @@ def main():
 
     def transmit_window(duration_s):
         """Transmit for duration_s seconds, going offline (Wi-Fi off,
-        CPU down-clocked) when the window is short enough to free-run
-        on the crystal without a mid-window re-sync."""
-        offline = duration_s <= config.NTP_RESYNC_MINUTES * 60
+        CPU down-clocked) when the whole window fits in what is left
+        of the NTP budget, so it can free-run on the crystal without
+        a mid-window re-sync."""
+        # Pin the end to the schedule first: a blocking re-sync below
+        # must shorten the window, never shift it past its end.
+        end_lsec = local_secs() + duration_s
+        need_ms = duration_s * 1000 + (clock.now_ms() - last_sync)
+        if duration_s * 1000 <= resync_ms < need_ms:
+            # The window could run offline on a full NTP budget but
+            # not on what is left of the current one (e.g. chained
+            # windows): refresh the budget with one blocking re-sync.
+            if try_resync():
+                need_ms = duration_s * 1000
+        offline = need_ms <= resync_ms
         if offline:
             print("Going offline for this window (Wi-Fi off%s)"
                   % (", CPU %d MHz" % slow_mhz if slow_mhz else ""))
-            ntp.close()
-            wifi_off(wlan)
+            wifi_drop()
             set_cpu(True)
-        transmit(local_secs() + duration_s, offline)
+        elif wifi_down:
+            # Online window with the chip torn down by an earlier
+            # offline window: bring it back up front rather than rely
+            # on the in-transmit background kick, and keep wifi_down
+            # truthful -- a stale flag would turn the pre-nap teardown
+            # into a no-op and light-sleep with the radio powered.
+            try_resync()
+        transmit(end_lsec, offline)
         set_cpu(False)
 
     def try_resync():
         """Reconnect Wi-Fi and re-sync the clock after a wake-up."""
-        nonlocal wlan, last_sync
+        nonlocal wlan, last_sync, wifi_down
+        wifi_down = False  # any connect attempt re-powers the chip
         try:
             wlan = connect_wifi(led)
         except OSError as exc:
@@ -552,6 +715,10 @@ def main():
             return False
         if sync_clock(ntp, clock):
             last_sync = clock.now_ms()
+            # On the failure path power save stays off until a later
+            # successful sync -- a deliberate power-for-reliability
+            # trade while the network is misbehaving.
+            wifi_pm_save(wlan)
             return True
         return False
 
@@ -568,7 +735,10 @@ def main():
     synced = True
     while True:
         remaining = window_remaining(windows, local_secs() % 86400)
-        if remaining > 0:
+        # transmit() exits during a window's final second, so every
+        # window leaves a 1 s tail; > 1 skips the degenerate call
+        # (which could otherwise trigger a pointless blocking re-sync).
+        if remaining > 1:
             if synced:
                 print("Window open for %d s" % remaining)
                 transmit_window(remaining)
@@ -587,8 +757,7 @@ def main():
             t = time.gmtime(local_secs() + delta)
             print("Sleeping %d s until next window at %02d:%02d"
                   % (nap_s, t[3], t[4]))
-            ntp.close()  # the socket does not survive the Wi-Fi teardown
-            wifi_off(wlan)
+            wifi_drop()
             time.sleep_ms(200)  # let the console output drain
             power_nap(clock, nap_s * 1000)
             synced = try_resync()
@@ -598,21 +767,31 @@ def main():
                 time.sleep(30)
         else:
             # Inside the wake margin with a verified clock: idle briefly
-            # until the window opens.
-            time.sleep_ms(min(delta, 10) * 1000)
+            # until the window opens.  If the coming window transmits
+            # offline anyway, drop Wi-Fi now instead of idling
+            # connected.  (POWER_SAVE excludes WATCHDOG, so an unfed
+            # 10 s sleep is safe.)
+            if next_window_offline(local_secs() % 86400):
+                wifi_drop()
+            time.sleep(min(delta, 10))
 
 
-try:
-    main()
-except Exception as exc:
-    print("Fatal error:", exc)
-    if getattr(config, "RESET_ON_ERROR", True):
-        print("Resetting in 10 s...")
-        for _ in range(10):
-            _feed()
-            time.sleep(1)
-        machine.reset()
-    else:
-        # With WATCHDOG enabled the board still resets ~8 s from now,
-        # because nothing feeds the watchdog anymore.
-        raise
+# MicroPython boots main.py as __main__; the guard lets host-side
+# tests (tests/) import this module without starting the transmitter.
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print("Fatal error:", exc)
+        # Read directly (not hoisted in main): this handler must work
+        # even when main() failed before its body ran.
+        if getattr(config, "RESET_ON_ERROR", True):
+            print("Resetting in 10 s...")
+            for _ in range(10):
+                _feed()
+                time.sleep(1)
+            machine.reset()
+        else:
+            # With WATCHDOG enabled the board still resets ~8 s from
+            # now, because nothing feeds the watchdog anymore.
+            raise

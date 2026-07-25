@@ -48,8 +48,9 @@ POWER_SAVE_WINDOWS = ("11:45-12:15", "23:45-00:15")
 # wake-up NTP sync and the CPU is down-clocked to this frequency (MHz)
 # to cut the transmit-time current roughly in half.  Set 0 to keep the
 # default clock (Wi-Fi is still switched off).  Applies whenever the
-# window fits within NTP_RESYNC_MINUTES, i.e. no mid-window re-sync is
-# needed.
+# window fits within the remaining NTP budget (normally the full
+# NTP_RESYNC_MINUTES right after the wake-up sync), i.e. no mid-window
+# re-sync is needed.
 POWER_SAVE_CPU_MHZ = 48
 
 # --- Misc ------------------------------------------------------------------
