@@ -18,6 +18,7 @@ All user settings live in config.py.
 """
 
 import gc
+import os
 import select
 import struct
 import time
@@ -43,6 +44,19 @@ def _ntp_utc_ms(secs, frac):
     """NTP timestamp (32-bit seconds since 1900 + 32-bit fraction) to
     UTC milliseconds since the port epoch."""
     return (secs - NTP_DELTA) * 1000 + (frac * 1000 >> 32)
+
+
+# Plausible absolute wall-clock window as UTC milliseconds since the
+# port epoch.  Derived from fixed NTP timestamps (seconds since
+# 1900-01-01) through _ntp_utc_ms, so the bounds come out correct on
+# both the 1970- and 2000-epoch ports without any epoch juggling.  A
+# decoded reply outside this window is rejected, so a spoofed or garbled
+# timestamp can neither set the clock to an absurd value nor drive
+# SyncedClock.ticks_at() into its OverflowError -> machine.reset() path.
+# (The 32-bit NTP seconds field wraps around Feb 2036, so the upper
+# bound is that era's ceiling rather than the ~2100 the report cites.)
+_MIN_UTC_MS = _ntp_utc_ms(3913056000, 0)  # 2024-01-01 00:00:00 UTC
+_MAX_UTC_MS = _ntp_utc_ms(4294967295, 0xFFFFFFFF)  # 2036-02-07 06:28:15 UTC (2**32 - 1)
 
 # Frame symbol codes: 0 and 1 are data bits, _MARK is a position
 # marker (the "M" of the JJY code).
@@ -150,6 +164,9 @@ class NTPClient:
         self._poll = select.poll()
         self._req = bytearray(48)
         self._req[0] = 0x1B  # LI=0, VN=3, Mode=3 (client)
+        # The random transmit-timestamp nonce of the in-flight request,
+        # so the reply's origin timestamp can be checked against it.
+        self._nonce = None
 
     def _setup(self):
         if self._addr is None:
@@ -162,9 +179,18 @@ class NTPClient:
             self._addr = socket.getaddrinfo(self.server, 123,
                                             socket.AF_INET,
                                             socket.SOCK_DGRAM)[0][-1]
+            # A re-resolved address may differ from the one the current
+            # socket is connect()-ed to; drop the socket so it is
+            # recreated and re-bound to the new server below.
+            if self._sock is not None:
+                self.close()
         if self._sock is None:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._sock.setblocking(False)
+            # Bind the socket to the resolved server: the network stack
+            # then delivers only datagrams from that peer, so a reply
+            # cannot be forged by any other host (origin authentication).
+            self._sock.connect(self._addr)
             self._poll.register(self._sock, select.POLLIN)
 
     def _note_failure(self):
@@ -205,6 +231,15 @@ class NTPClient:
             while self._poll.poll(0):
                 self._sock.recvfrom(48)
             _feed()
+            # Write a fresh unpredictable 64-bit nonce into the request's
+            # transmit-timestamp field (bytes 40-47).  The server echoes
+            # it into the reply's origin-timestamp field, so only a reply
+            # to *this* request can be accepted.  A per-query nonce also
+            # means a stale reply drained above can never match.  The
+            # slice assignment writes into the preallocated buffer in
+            # place (no new 48-byte request per query).
+            self._nonce = os.urandom(8)
+            self._req[40:48] = self._nonce
             t_send = time.ticks_ms()
             self._sock.sendto(self._req, self._addr)
             deadline = time.ticks_add(t_send, budget_ms)
@@ -221,13 +256,34 @@ class NTPClient:
                 t_recv = time.ticks_ms()
                 if len(data) < 48:
                     continue
+                # Well-formed server reply only: mode must be 4 (server),
+                # the leap indicator must not be 3 (unsynchronized/alarm)
+                # and the stratum must be a synchronized 1..15.  byte 0 is
+                # LI(2) | VN(3) | Mode(3); byte 1 is the stratum.
+                if (data[0] & 0x07) != 4 or (data[0] >> 6) == 3 \
+                        or not 1 <= data[1] <= 15:
+                    continue
+                # Anti-spoofing: the reply's origin timestamp (bytes
+                # 24-31) must echo exactly the nonce we sent.  Anything
+                # else is an off-path forgery or a stale/unrelated reply.
+                if data[24:32] != self._nonce:
+                    continue
                 # Transmit timestamp: 32-bit seconds + fraction, big endian.
                 secs, frac = struct.unpack_from("!II", data, 40)
                 utc_ms = _ntp_utc_ms(secs, frac)
+                # Reject an implausible wall-clock value before it can
+                # reach SyncedClock (wrong time / OverflowError reset).
+                if not _MIN_UTC_MS <= utc_ms <= _MAX_UTC_MS:
+                    continue
                 rtt = time.ticks_diff(t_recv, t_send)
                 self._failures = 0
                 return utc_ms, time.ticks_add(t_send, rtt // 2)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # OSError: network/socket failure.  ValueError: malformed
+            # reply that slipped through the length checks (the fixed
+            # "!II" unpack at offset 40 cannot fail after the len>=48
+            # check above, so this is defensive).  Either way this
+            # attempt failed; stay polite and retry.
             print("NTP query error:", exc)
             self.close()
         self._note_failure()
@@ -397,12 +453,13 @@ def parse_windows(specs):
 
 def window_remaining(windows, sec_of_day):
     """Seconds left in the window covering sec_of_day, or 0 if outside."""
+    remaining = 0
     for start, end in windows:
         length = (end - start) % 86400
         elapsed = (sec_of_day - start) % 86400
         if elapsed < length:
-            return length - elapsed
-    return 0
+            remaining = max(remaining, length - elapsed)
+    return remaining
 
 
 def next_window_delta(windows, sec_of_day):
@@ -471,6 +528,22 @@ def main():
     slow_mhz = getattr(config, "POWER_SAVE_CPU_MHZ", 0)
     if power_save and slow_mhz and not 20 <= slow_mhz <= 150:
         raise ValueError("POWER_SAVE_CPU_MHZ must be 0 or 20..150")
+    if not 0.0 <= config.CARRIER_DUTY <= 1.0:
+        raise ValueError("CARRIER_DUTY must be 0.0-1.0")
+    if not 0 <= config.ANTENNA_PIN <= 29:
+        raise ValueError("ANTENNA_PIN must be 0..29")
+    if not -12 <= config.TIME_OFFSET_HOURS <= 14:
+        raise ValueError("TIME_OFFSET_HOURS must be -12..14")
+    if config.NTP_RESYNC_MINUTES <= 0:
+        raise ValueError("NTP_RESYNC_MINUTES must be > 0")
+    if config.NTP_RETRIES < 1:
+        raise ValueError("NTP_RETRIES must be >= 1")
+    if config.WIFI_TIMEOUT_S <= 0:
+        raise ValueError("WIFI_TIMEOUT_S must be > 0")
+    if config.NTP_TIMEOUT_S <= 0:
+        raise ValueError("NTP_TIMEOUT_S must be > 0")
+    if power_save and getattr(config, "POWER_SAVE_STARTUP_MINUTES", 0) < 0:
+        raise ValueError("POWER_SAVE_STARTUP_MINUTES must be >= 0")
 
     if watchdog:
         # A single NTP receive must stay comfortably inside the 8 s
@@ -488,9 +561,15 @@ def main():
     pwm.duty_u16(0)
     duty_on = int(config.CARRIER_DUTY * 65535)
 
+    # While Wi-Fi is shut down for offline transmission the onboard LED
+    # sits behind the CYW43 chip: touching it could re-power the radio
+    # (cyw43_ensure_up) and wipe out the power saving.  transmit() mutes
+    # the LED for the whole offline window; the PWM carrier is unaffected.
+    led_muted = [False]
+
     def carrier(on):
         pwm.duty_u16(duty_on if on else 0)
-        if led:
+        if led and not led_muted[0]:
             # The LED mirrors the modulation: pulse length shows the
             # current symbol (0.2 s = marker, 0.5 s = 1, 0.8 s = 0).
             led.value(1 if on else 0)
@@ -547,6 +626,7 @@ def main():
         NTP_RESYNC_MINUTES).
         """
         nonlocal wlan, last_sync
+        led_muted[0] = offline
         print("Transmitting JJY on GPIO%d at %d kHz"
               % (config.ANTENNA_PIN, config.JJY_FREQUENCY_KHZ))
         frame = None
@@ -620,6 +700,7 @@ def main():
                 gc.collect()
 
             next_idx += 1
+        led_muted[0] = False
         carrier(False)
 
     if not power_save:
